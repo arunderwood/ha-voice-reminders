@@ -1,0 +1,1076 @@
+# Reminders: the intents that create them, and the automations that fire them.
+# Pairs with custom_sentences/en/reminders.yaml, which holds the grammar that
+# fills these slots.
+#
+# All date arithmetic happens here, in Jinja, on integers the grammar already
+# validated -- never in the model. See PLAN.md.
+#
+# platforms: [conversation] is doing two jobs, both deliberate:
+#
+#   1. IntentHandler.async_can_handle (helpers/intent.py:831) only admits the
+#      listed calling platforms. The voice path calls intent.async_handle with
+#      platform "conversation" (default_agent.py:565), so voice works.
+#   2. intent_script/llm.py exposes every intent_script as an LLM tool unless
+#      `platforms` names a domain with no entities exposed to the assistant.
+#      Nothing in the conversation domain is exposed, so these two stay OUT of
+#      the LLM's tool list.
+#
+# Rule 2 matters more than it sounds. IntentTool builds its parameters from
+# ScriptIntentHandler.slot_schema, which is the generic name/area/floor set --
+# it knows nothing about {task} or {hour}. Without this line the model gets two
+# tempting reminder tools whose parameters cannot express a reminder, and calls
+# them with garbage the moment someone says "remind me tomorrow morning".
+# The LLM path is phase 5's job, via a script with real fields.
+#
+# Note: this also means /api/intent/handle (platform "http") cannot invoke
+# these. Test through the pipeline, not that endpoint.
+#
+# These responses SPEAK rather than beep. The acknowledgement-beep rule
+# (findings §1) needs response.matched_states to be non-empty
+# (pipeline.py:_get_all_targets_in_satellite_area returns False on an empty
+# list), and an intent_script that targets no name/area/floor never sets any.
+# Holds the summary of the most recently announced reminder, so "snooze" knows
+# what "that" refers to. Not exposed to conversation: it changes on every
+# reminder and would churn the LLM prompt cache (findings §4).
+input_text:
+  last_reminder:
+    name: Last reminder announced
+    icon: mdi:bell-sleep
+    max: 255
+
+# ...and when it was announced. Without this the summary above never expires,
+# so "snooze" at 3pm cheerfully resurrects something that fired at 9am -- or,
+# as actually happened, a test reminder from twenty minutes earlier.
+input_datetime:
+  last_reminder_at:
+    name: Last reminder announced at
+    icon: mdi:bell-sleep
+    has_date: true
+    has_time: true
+
+intent_script:
+  # "remind me at 2 pm to do laundry"
+  SetReminderAbsolute:
+    platforms: [conversation]
+    action:
+      # ======================= CONFIGURATION =======================
+      # The only two identifiers a second installation has to change.
+      # Both are YAML anchors; every other reference in this file is
+      # *reminder_list or *notify_target, so changing them here changes
+      # them everywhere.
+      #
+      # This block sits inside an intent_script rather than in a tidy
+      # settings section at the top of the file because a package
+      # containing an unknown top-level key fails to set up at all --
+      # "Integration 'reminders_settings' not found" -- and a YAML anchor
+      # must be declared before it is used. This is the earliest legal
+      # place for it.
+      - variables:
+          reminders_list: &reminder_list todo.reminders
+          reminders_notify: &notify_target notify.mobile_app_your_phone
+      # =============================================================
+
+      # A wildcard can only be trusted to be non-empty once trimmed. If it is
+      # empty the condition aborts the script, which leaves action_response
+      # undefined and the speech template says so instead of filing a blank.
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      # A bare hour ("remind me at 2") has two readings, and the naive rule --
+      # try today, else roll to tomorrow -- picks 2 AM when both 2am and 2pm
+      # have already passed. Nobody means 2 AM. So: build every candidate over
+      # today and tomorrow, discard anything before 06:00 unless a meridiem was
+      # actually said, and take the earliest that is still ahead. "at 2" at
+      # 15:36 becomes 2 PM tomorrow; at 10:00 it becomes 2 PM today.
+      #
+      # An explicit meridiem, or a 24-hour hour like 14:30, has exactly one
+      # reading and skips the whole heuristic.
+      - variables:
+          due: >-
+            {# hourshift is -1 for "quarter to", injected by the grammar. #}
+            {% set raw = (hour | int) + (hourshift | default(0, true) | int(0)) %}
+            {% set m = minute | default(0, true) | int %}
+            {% set mer = meridiem | default('', true) | lower %}
+            {% set explicit = (mer != '') or raw > 12 %}
+            {% if explicit %}
+              {% if mer == 'pm' and raw < 12 %}{% set hours = [raw + 12] %}
+              {% elif mer == 'am' and raw == 12 %}{% set hours = [0] %}
+              {% else %}{% set hours = [raw] %}{% endif %}
+            {% else %}
+              {% set base = raw % 12 %}
+              {% set hours = [base, base + 12] %}
+            {% endif %}
+            {% set ns = namespace(best=none) %}
+            {% for day in [0, 1] %}
+              {% for hh in hours %}
+                {% set c = today_at('%02d:%02d' | format(hh, m)) + timedelta(days=day) %}
+                {% if c > now() and (explicit or hh >= 6)
+                      and (ns.best is none or c < ns.best) %}
+                  {% set ns.best = c %}
+                {% endif %}
+              {% endfor %}
+            {% endfor %}
+            {{ ns.best.isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task | trim }}"
+          due_datetime: "{{ due }}"
+
+      - variables:
+          reminder: &reminder_vars
+            task: "{{ task | trim }}"
+            when: >-
+              {% set d = due | as_datetime | as_local %}
+              {% set h12 = d.hour % 12 %}
+              {% set h12 = 12 if h12 == 0 else h12 %}
+              {% set clock = h12 ~ (':%02d' | format(d.minute) if d.minute else '') ~ (' AM' if d.hour < 12 else ' PM') %}
+              {% set days = (d.date() - now().date()).days %}
+              {{ clock }}{% if days == 1 %} tomorrow{% elif days > 1 and days < 7 %} on {{ d.strftime('%A') }}{% elif days >= 7 %} on {{ d.strftime('%A') }}, {{ d.strftime('%B') }} {{ d.day }}{% endif %}
+
+      # Carries the resolved time back to the speech template, which otherwise
+      # only sees the raw slots and would have to repeat the arithmetic above.
+      - stop: "reminder scheduled"
+        response_variable: reminder
+
+    speech:
+      text: &reminder_speech >-
+        {% if action_response is not defined %}
+          {{ "No reminder was set: no task was given." }}
+        {% else %}
+          {% set task = action_response.task %}
+          {% set when = action_response.when %}
+          {# The confirmation always states the time and the task: one that
+             omits them confirms nothing. See examples/personality.md to make
+             this more characterful. #}
+          {{ "Reminder set for " ~ when ~ ": " ~ task ~ "." }}
+        {% endif %}
+
+  # "remind me tomorrow morning to call the bank" -- the fuzzy dayparts. The
+  # grammar resolves the word to an hour, so this only has to place the day.
+  SetReminderDaypart:
+    platforms: [conversation]
+    action:
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      - variables:
+          due: >-
+            {% set h = hour | int %}
+            {% set mi = minute | default(0, true) | int(0) %}
+            {% set mer = meridiem | default('', true) | lower %}
+            {% if mer == 'pm' and h < 12 %}{% set h = h + 12 %}{% endif %}
+            {% if mer == 'am' and h == 12 %}{% set h = 0 %}{% endif %}
+            {% set off = dayref | default(0, true) | int(0) %}
+            {% set t = today_at('%02d:%02d' | format(h, mi)) + timedelta(days=off) %}
+            {# "in the morning" said at 4pm, or "this evening" said at 11pm,
+               both mean the next one. #}
+            {{ (t + timedelta(days=1) if t <= now() else t).isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task | trim }}"
+          due_datetime: "{{ due }}"
+
+      - variables:
+          reminder: *reminder_vars
+
+      - stop: "reminder scheduled"
+        response_variable: reminder
+
+    speech:
+      text: *reminder_speech
+
+  # "remind me in 20 minutes to check the oven"
+  SetReminderRelative:
+    platforms: [conversation]
+    action:
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      - variables:
+          due: >-
+            {% set n = count | int %}
+            {% if unit == 'weeks' %}{% set t = now() + timedelta(days=7 * n) %}
+            {% elif unit == 'days' %}{% set t = now() + timedelta(days=n) %}
+            {% elif unit == 'hours' %}{% set t = now() + timedelta(hours=n) %}
+            {% else %}{% set t = now() + timedelta(minutes=n) %}{% endif %}
+            {# Seconds are kept, so the once-a-minute dispatcher fires on the
+               boundary AFTER the true due time -- late by under a minute,
+               never early. #}
+            {{ t.replace(microsecond=0).isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task | trim }}"
+          due_datetime: "{{ due }}"
+
+      - variables:
+          reminder: *reminder_vars
+
+      - stop: "reminder scheduled"
+        response_variable: reminder
+
+    speech:
+      text: *reminder_speech
+
+  # "remind me in three days at 10am to check the thing"
+  SetReminderRelativeAt:
+    platforms: [conversation]
+    action:
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      - variables:
+          due: >-
+            {% set n = count | int %}
+            {% set days = 7 * n if unit == 'weeks' else n %}
+            {# hour arrives as a clock hour (10) or a daypart ("8"); both int. #}
+            {% set h = hour | default(9, true) | int(9) %}
+            {% set mi = minute | default(0, true) | int(0) %}
+            {% set mer = meridiem | default('', true) | lower %}
+            {% if mer == 'pm' and h < 12 %}{% set h = h + 12 %}{% endif %}
+            {% if mer == 'am' and h == 12 %}{% set h = 0 %}{% endif %}
+            {# The offset is at least a day, so no roll-forward is needed. #}
+            {{ (today_at('%02d:%02d' | format(h, mi)) + timedelta(days=days)).isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task | trim }}"
+          due_datetime: "{{ due }}"
+
+      - variables:
+          reminder: *reminder_vars
+
+      - stop: "reminder scheduled"
+        response_variable: reminder
+
+    speech:
+      text: *reminder_speech
+
+  # "remind me Friday evening to call mum"
+  SetReminderWeekday:
+    platforms: [conversation]
+    action:
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      - variables:
+          due: >-
+            {% set wd = weekday | int %}
+            {# hour arrives either as a daypart ("19") or a clock hour (9); both
+               go through int. Absent entirely means no time was said at all. #}
+            {% set h = hour | default(9, true) | int(9) %}
+            {% set mi = minute | default(0, true) | int(0) %}
+            {% set mer = meridiem | default('', true) | lower %}
+            {% if mer == 'pm' and h < 12 %}{% set h = h + 12 %}{% endif %}
+            {% if mer == 'am' and h == 12 %}{% set h = 0 %}{% endif %}
+            {% set delta = (wd - now().weekday()) % 7 %}
+            {% set t = today_at('%02d:%02d' | format(h, mi)) + timedelta(days=delta) %}
+            {# Said on the day itself, before the time: today. After it: next week. #}
+            {{ (t + timedelta(days=7) if t <= now() else t).isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task | trim }}"
+          due_datetime: "{{ due }}"
+
+      - variables:
+          reminder: *reminder_vars
+
+      - stop: "reminder scheduled"
+        response_variable: reminder
+
+    speech:
+      text: *reminder_speech
+
+  # "remind me every day at 10:30 to take the medicine"
+  #
+  # Recurrence lives in the item's own description (see the grammar file for
+  # why). This computes the FIRST occurrence; the dispatcher computes every one
+  # after that when the item fires.
+  SetReminderRecurring:
+    platforms: [conversation]
+    action:
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      - variables:
+          h_raw: "{{ hour | default(9, true) | int(9) }}"
+          mi: "{{ minute | default(0, true) | int(0) }}"
+          mer: "{{ meridiem | default('', true) | lower }}"
+          kind: "{{ freq | default('daily', true) }}"
+          wd: "{{ weekday | default(0, true) | int(0) }}"
+
+      - variables:
+          h: >-
+            {% set h = h_raw | int %}
+            {% if mer == 'pm' and h < 12 %}{% set h = h + 12 %}{% endif %}
+            {% if mer == 'am' and h == 12 %}{% set h = 0 %}{% endif %}
+            {{ h }}
+
+      - variables:
+          due: >-
+            {% set base = today_at('%02d:%02d' | format(h | int, mi | int)) %}
+            {% if kind == 'weekly' %}
+              {% set t = base + timedelta(days=((wd | int) - now().weekday()) % 7) %}
+              {{ (t + timedelta(days=7) if t <= now() else t).isoformat() }}
+            {% elif kind == 'weekdays' %}
+              {% set t = base if base > now() else base + timedelta(days=1) %}
+              {% set ns = namespace(t=t) %}
+              {# Saturday is 5, Sunday 6 -- walk forward to Monday. #}
+              {% for _ in range(3) %}
+                {% if ns.t.weekday() > 4 %}{% set ns.t = ns.t + timedelta(days=1) %}{% endif %}
+              {% endfor %}
+              {{ ns.t.isoformat() }}
+            {% else %}
+              {{ (base + timedelta(days=1) if base <= now() else base).isoformat() }}
+            {% endif %}
+          repeat_spec: >-
+            {% if kind == 'weekly' %}repeat:weekly:{{ wd | int }}{% elif kind == 'weekdays' %}repeat:weekdays{% else %}repeat:daily{% endif %}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task | trim }}"
+          due_datetime: "{{ due }}"
+          description: "{{ repeat_spec }}"
+
+      - variables:
+          reminder:
+            task: "{{ task | trim }}"
+            when: >-
+              {%- set d = as_datetime(due) | as_local -%}
+              {%- set h12 = d.hour % 12 -%}
+              {%- set h12 = 12 if h12 == 0 else h12 -%}
+              {{- h12 }}{{ ':%02d' | format(d.minute) if d.minute else '' }} {{ 'AM' if d.hour < 12 else 'PM' }} {% if kind == 'weekly' %}every {{ d.strftime('%A') }}{% elif kind == 'weekdays' %}every weekday{% else %}every day{% endif %}
+
+      - stop: "recurring reminder scheduled"
+        response_variable: reminder
+
+    speech:
+      text: *reminder_speech
+
+  # "snooze" / "snooze for 20 minutes" / "remind me again in 5 minutes"
+  #
+  # Reads the task from input_text.last_reminder, which the dispatch automation
+  # writes every time it announces something. Without that there is no way to
+  # know which reminder "that one" means.
+  SnoozeReminder:
+    platforms: [conversation]
+    action:
+      - variables:
+          last: "{{ states('input_text.last_reminder') | default('', true) | trim }}"
+          # Seconds since the last announcement. The input_datetime carries a
+          # `timestamp` attribute, so no parsing and no timezone trap.
+          age: >-
+            {% set ts = state_attr('input_datetime.last_reminder_at', 'timestamp') %}
+            {{ ((as_timestamp(now()) - ts) | round(0) | int) if ts is not none else 999999 }}
+
+      - choose:
+          - conditions: "{{ last in ['', 'unknown', 'unavailable'] }}"
+            sequence:
+              - variables:
+                  out:
+                    speech: >-
+                      Nothing to snooze.
+              - stop: "nothing to snooze"
+                response_variable: out
+
+          # An hour. Long enough to walk back into the room, short enough that
+          # "snooze" cannot resurrect this morning's reminder.
+          - conditions: "{{ (age | int) > 3600 }}"
+            sequence:
+              - variables:
+                  out:
+                    speech: >-
+                      {% set mins = ((age | int) / 60) | round(0) | int %}
+                      {% set ago = (mins ~ " minutes") if mins < 120 else (((mins / 60) | round(0) | int) ~ " hours") %}
+                      Nothing recent to snooze. The last reminder was {{ ago }} ago.
+              - stop: "too old to snooze"
+                response_variable: out
+
+      - variables:
+          due: >-
+            {% set n = count | default(10, true) | int(10) %}
+            {% set u = unit | default('minutes', true) %}
+            {% if u == 'weeks' %}{% set t = now() + timedelta(days=7 * n) %}
+            {% elif u == 'days' %}{% set t = now() + timedelta(days=n) %}
+            {% elif u == 'hours' %}{% set t = now() + timedelta(hours=n) %}
+            {% else %}{% set t = now() + timedelta(minutes=n) %}{% endif %}
+            {{ t.replace(microsecond=0).isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ last }}"
+          due_datetime: "{{ due }}"
+
+      - variables:
+          out:
+            speech: >-
+              {%- set d = as_datetime(due) | as_local -%}
+              {%- set h12 = d.hour % 12 -%}
+              {%- set h12 = 12 if h12 == 0 else h12 -%}
+              {%- set days = (d.date() - now().date()).days -%}
+              {%- set clock = h12 ~ (':%02d' | format(d.minute) if d.minute else '') ~ (' AM' if d.hour < 12 else ' PM')
+                    ~ (' tomorrow' if days == 1 else (' on ' ~ d.strftime('%A') if days > 1 else '')) -%}
+              Snoozed. {{ last }} again at {{ clock }}.
+
+      - stop: "snoozed"
+        response_variable: out
+
+    speech:
+      text: "{{ action_response.speech }}"
+
+  # --- Reading and cancelling ---------------------------------------------
+  #
+  # These read the list back rather than reporting what they were asked to do,
+  # for the same reason the LLM script does (findings §16/§18): a confirmation
+  # that is not derived from the data is just a claim.
+
+  ListReminders:
+    platforms: [conversation]
+    action:
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: needs_action
+        response_variable: pending
+
+      # Sorted on a NUMERIC timestamp, not the ISO string. String sort looks
+      # identical until a DST change puts -05:00 and -06:00 in the same list.
+      - variables:
+          rows: >-
+            {% set ns = namespace(rows=[]) %}
+            {% for i in (pending.values() | list | first)['items'] %}
+              {% if i.due is defined and 'T' in i.due %}
+                {% set ns.rows = ns.rows + [{'ts': as_timestamp(as_datetime(i.due)),
+                                             'due': i.due, 'summary': i.summary,
+                                             'repeat': i.description | default('', true)}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.rows | sort(attribute='ts') }}
+
+      - variables:
+          out:
+            speech: >-
+              {%- macro whenphrase(iso) -%}
+                {%- set d = as_datetime(iso) | as_local -%}
+                {%- set h12 = d.hour % 12 -%}
+                {%- set h12 = 12 if h12 == 0 else h12 -%}
+                {{- h12 }}{{ ':%02d' | format(d.minute) if d.minute else '' }} {{ 'AM' if d.hour < 12 else 'PM' }}{{ '' if d.date() == now().date() else (' tomorrow' if d.date() == (now() + timedelta(days=1)).date() else ' on ' ~ d.strftime('%A')) -}}
+              {%- endmacro -%}
+              {% set n = rows | count %}
+              {% if n == 0 %}
+                {{ "No reminders." }}
+              {% else %}
+                {{ n }} reminder{{ 's' if n != 1 else '' }}.
+                {%- for r in rows[:5] %} {{ whenphrase(r.due) }}, {{ r.summary }}{% if r.repeat.startswith('repeat:') %}, {% set k = r.repeat.split(':') %}{% if k[1] == 'weekly' %}every {{ (as_datetime(r.due) | as_local).strftime('%A') }}{% elif k[1] == 'weekdays' %}every weekday{% else %}every day{% endif %}{% endif %}.{% endfor %}
+                {%- if n > 5 %} And {{ n - 5 }} more.{% endif %}
+              {% endif %}
+
+      - stop: "listed"
+        response_variable: out
+
+    speech:
+      text: "{{ action_response.speech }}"
+
+  # "open my reminders" -- the satellite has no screen, so the list goes to the
+  # phone.
+  #
+  # This sends a TAPPABLE notification rather than command_webview. Android 10+
+  # blocks apps from starting an activity in the background, so command_webview
+  # needs the "Display over other apps" permission and otherwise answers with a
+  # notification explaining that it did nothing. Tapping a notification is a
+  # user-initiated launch, which Android always allows, so this works out of the
+  # box on any phone.
+  #
+  # To make it open instantly instead, grant that permission and swap the data
+  # block for:
+  #     message: "command_webview"
+  #     data: { command: "/todo" }
+  OpenReminderList:
+    platforms: [conversation]
+    action:
+      - action: *notify_target
+        data:
+          title: Reminders
+          message: "Tap to open your list"
+          data:
+            clickAction: "/todo"
+            tag: reminders_open
+
+    speech:
+      text: >-
+        Sent to your phone — tap it to open the list.
+
+  # "cancel the reminder to do laundry"
+  CancelReminder:
+    platforms: [conversation]
+    action:
+      - condition: template
+        value_template: "{{ task | default('', true) | trim != '' }}"
+
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: needs_action
+        response_variable: pending
+
+      - variables:
+          needle: "{{ task | default('', true) | trim | lower }}"
+
+      # Matched loosely in both directions: heard "laundry" should find "do
+      # laundry", and heard "do the laundry" should still find "do laundry".
+      - variables:
+          matches: >-
+            {% set ns = namespace(rows=[]) %}
+            {% for i in (pending.values() | list | first)['items'] %}
+              {% set s = i.summary | lower %}
+              {% if needle in s or s in needle %}
+                {% set ns.rows = ns.rows + [{
+                     'ts': as_timestamp(as_datetime(i.due)) if (i.due is defined and 'T' in i.due) else 0,
+                     'uid': i.uid, 'due': i.due | default(''), 'summary': i.summary}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.rows | sort(attribute='ts') }}
+
+      - choose:
+          - conditions: "{{ matches | count == 0 }}"
+            sequence:
+              - variables:
+                  out:
+                    speech: >-
+                      No reminder about {{ task | trim }}.
+              - stop: "no match"
+                response_variable: out
+
+      # Cancels the SOONEST match and says which, rather than refusing when
+      # several match. Refusing leaves no way forward by voice; this always
+      # makes progress and reports exactly what it did.
+      - action: todo.remove_item
+        target:
+          entity_id: *reminder_list
+        data:
+          item: "{{ matches[0].uid }}"
+
+      - variables:
+          out:
+            speech: >-
+              {%- macro whenphrase(iso) -%}
+                {%- set d = as_datetime(iso) | as_local -%}
+                {%- set h12 = d.hour % 12 -%}
+                {%- set h12 = 12 if h12 == 0 else h12 -%}
+                {{- h12 }}{{ ':%02d' | format(d.minute) if d.minute else '' }} {{ 'AM' if d.hour < 12 else 'PM' }}{{ '' if d.date() == now().date() else (' tomorrow' if d.date() == (now() + timedelta(days=1)).date() else ' on ' ~ d.strftime('%A')) -}}
+              {%- endmacro -%}
+              {% set m = matches | count %}
+              Cancelled {{ matches[0].summary }}{% if matches[0].due %}, {{ whenphrase(matches[0].due) }}{% endif %}.
+              {%- if m > 1 %} {{ m - 1 }} other{{ 's' if m > 2 else '' }} matched and {{ 'were' if m > 2 else 'was' }} left alone.{% endif %}
+
+      - stop: "cancelled"
+        response_variable: out
+
+    speech:
+      text: >-
+        {% if action_response is not defined %}
+          Cancel which reminder. You did not say.
+        {% else %}
+          {{ action_response.speech }}
+        {% endif %}
+
+  CancelNextReminder:
+    platforms: [conversation]
+    action:
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: needs_action
+        response_variable: pending
+
+      - variables:
+          rows: >-
+            {% set ns = namespace(rows=[]) %}
+            {% for i in (pending.values() | list | first)['items'] %}
+              {% if i.due is defined and 'T' in i.due %}
+                {% set ns.rows = ns.rows + [{'ts': as_timestamp(as_datetime(i.due)),
+                                             'uid': i.uid, 'due': i.due, 'summary': i.summary}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.rows | sort(attribute='ts') }}
+
+      - choose:
+          - conditions: "{{ rows | count == 0 }}"
+            sequence:
+              - variables:
+                  out:
+                    speech: >-
+                      No reminders.
+              - stop: "empty"
+                response_variable: out
+
+      - action: todo.remove_item
+        target:
+          entity_id: *reminder_list
+        data:
+          item: "{{ rows[0].uid }}"
+
+      - variables:
+          out:
+            speech: >-
+              {%- macro whenphrase(iso) -%}
+                {%- set d = as_datetime(iso) | as_local -%}
+                {%- set h12 = d.hour % 12 -%}
+                {%- set h12 = 12 if h12 == 0 else h12 -%}
+                {{- h12 }}{{ ':%02d' | format(d.minute) if d.minute else '' }} {{ 'AM' if d.hour < 12 else 'PM' }}{{ '' if d.date() == now().date() else (' tomorrow' if d.date() == (now() + timedelta(days=1)).date() else ' on ' ~ d.strftime('%A')) -}}
+              {%- endmacro -%}
+              Cancelled {{ rows[0].summary }}, {{ whenphrase(rows[0].due) }}.
+              {%- set left = (rows | count) - 1 %}
+              {%- if left > 0 %} {{ left }} reminder{{ 's' if left != 1 else '' }} left.{% endif %}
+
+      - stop: "cancelled next"
+        response_variable: out
+
+    speech:
+      text: "{{ action_response.speech }}"
+
+  CancelAllReminders:
+    platforms: [conversation]
+    action:
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: needs_action
+        response_variable: pending
+
+      - variables:
+          uids: >-
+            {{ (pending.values() | list | first)['items'] | map(attribute='uid') | list }}
+
+      - choose:
+          - conditions: "{{ uids | count == 0 }}"
+            sequence:
+              - variables:
+                  out:
+                    speech: >-
+                      There were none to cancel.
+              - stop: "empty"
+                response_variable: out
+
+      # remove_item takes a LIST -- cv.ensure_list on the item field -- so the
+      # whole list goes in one call rather than a repeat loop.
+      - action: todo.remove_item
+        target:
+          entity_id: *reminder_list
+        data:
+          item: "{{ uids }}"
+
+      - variables:
+          out:
+            speech: >-
+              {% set n = uids | count %}
+              {{ n }} reminder{{ 's' if n != 1 else '' }} cancelled.
+
+      - stop: "cancelled all"
+        response_variable: out
+
+    speech:
+      text: "{{ action_response.speech }}"
+
+# ---------------------------------------------------------------------------
+# Dispatch. One polling automation rather than a scheduled job per reminder, so
+# pending reminders survive restarts: they live in the .ics, and this notices
+# them whenever it next runs. If HA is down at the due minute the reminder
+# fires late rather than never -- and after a long outage everything overdue
+# fires at once, which is the intended behaviour, not a bug to suppress.
+#
+# Announcing targets every Assist satellite that reports the ANNOUNCE feature,
+# resolved at run time. A second Voice PE starts getting reminders the moment
+# it is adopted, with no edit here. Cast speakers are deliberately NOT targets:
+# they are exposed to the LLM, so talking through them would churn their state
+# and invalidate the prompt cache (findings §4).
+# ---------------------------------------------------------------------------
+automation:
+  - id: reminders_dispatch
+    alias: Reminders — announce and push due items
+    description: >-
+      Every minute, complete any reminder whose due time has passed, push it to
+      the Pixel, and announce it on every Assist satellite.
+    mode: single
+    # An announcement can outlast the next tick. Skipping quietly is correct;
+    # the skipped items are still due on the following run.
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: "*"
+    conditions:
+      # A todo entity's state is its needs_action count, so this skips the
+      # service call entirely on the overwhelming majority of ticks.
+      - condition: numeric_state
+        entity_id: *reminder_list
+        above: 0
+    actions:
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: needs_action
+        response_variable: pending
+
+      - variables:
+          # get_items renders `due` in HA's local zone rather than the offset it
+          # was stored with, so this must go through as_datetime and compare
+          # tz-aware values -- never string-compare (PLAN.md phase 2).
+          # Items with a date-only due (no "T") are not reminders; skip them.
+          due_now: >-
+            {% set ns = namespace(items=[]) %}
+            {% for i in (pending.values() | list | first)['items'] %}
+              {% if i.due is defined and 'T' in i.due
+                    and as_datetime(i.due) <= now() %}
+                {# `due` is carried because a recurring series computes its next
+                   occurrence from the DUE time, not from now. #}
+                {% set ns.items = ns.items + [{'uid': i.uid, 'summary': i.summary,
+                                               'due': i.due,
+                                               'description': i.description | default('', true)}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.items }}
+
+          announce_targets: >-
+            {% set ns = namespace(ids=[]) %}
+            {% for s in states.assist_satellite %}
+              {% if s.state not in ['unavailable', 'unknown']
+                    and (s.attributes.supported_features | int(0)) | bitwise_and(1) %}
+                {% set ns.ids = ns.ids + [s.entity_id] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.ids }}
+
+      - repeat:
+          for_each: "{{ due_now }}"
+          sequence:
+            # Completed FIRST, on purpose. The acceptance criterion is that a
+            # reminder fires once and does not repeat; if the announce failed
+            # after the item was still needs_action, this would re-fire and
+            # re-push every single minute forever.
+            - action: todo.update_item
+              target:
+                entity_id: *reminder_list
+              data:
+                item: "{{ repeat.item.uid }}"   # uid, not summary: two reminders can both say "do laundry"
+                status: completed
+
+            # A recurring reminder schedules its successor here, straight
+            # after being completed and before anything that can fail, so the
+            # series survives an unreachable satellite. The next occurrence is
+            # computed from the DUE time, not from now, so a series does not
+            # drift later every time it fires -- and it is advanced until it is
+            # genuinely in the future, so a week of downtime produces one
+            # reminder rather than seven.
+            - if:
+                - condition: template
+                  value_template: "{{ repeat.item.description.startswith('repeat:') }}"
+              then:
+                - variables:
+                    spec: "{{ repeat.item.description.split(':') }}"
+                - variables:
+                    next_due: >-
+                      {% set kind = spec[1] %}
+                      {% set ns = namespace(t = as_datetime(repeat.item.due) | as_local) %}
+                      {% for _ in range(400) %}
+                        {% if ns.t <= now() %}
+                          {% if kind == 'weekly' %}
+                            {% set ns.t = ns.t + timedelta(days=7) %}
+                          {% elif kind == 'weekdays' %}
+                            {% set ns.t = ns.t + timedelta(days=1) %}
+                            {% if ns.t.weekday() > 4 %}
+                              {% set ns.t = ns.t + timedelta(days=(7 - ns.t.weekday())) %}
+                            {% endif %}
+                          {% else %}
+                            {% set ns.t = ns.t + timedelta(days=1) %}
+                          {% endif %}
+                        {% endif %}
+                      {% endfor %}
+                      {{ ns.t.isoformat() }}
+                - action: todo.add_item
+                  data:
+                    entity_id: *reminder_list
+                    item: "{{ repeat.item.summary }}"
+                    due_datetime: "{{ next_due }}"
+                    description: "{{ repeat.item.description }}"
+
+            # Recorded before anything can fail, so "snooze" still works even
+            # if the announce or the push does not.
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.last_reminder
+              data:
+                value: "{{ repeat.item.summary[:255] }}"
+
+            - action: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.last_reminder_at
+              data:
+                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+            # Before the announce, so a silent satellite still reaches the phone.
+            - action: *notify_target
+              data:
+                title: Reminder
+                message: "{{ repeat.item.summary }}"
+                data:
+                  # One notification per reminder rather than one that keeps
+                  # getting replaced.
+                  tag: "reminder_{{ repeat.item.uid }}"
+                  actions:
+                    # action_data is documented as returned on iOS; Android may
+                    # drop it, so the handler falls back to
+                    # input_text.last_reminder and works either way.
+                    - action: REM_SNOOZE_10
+                      title: Snooze 10 min
+                      action_data:
+                        task: "{{ repeat.item.summary }}"
+                    - action: REM_SNOOZE_60
+                      title: Snooze 1 hour
+                      action_data:
+                        task: "{{ repeat.item.summary }}"
+
+            - action: assist_satellite.announce
+              continue_on_error: true
+              target:
+                entity_id: "{{ announce_targets }}"
+              data:
+                # preannounce is the satellite's own chime, not the
+                # acknowledgement beep of findings §1. It is wanted here: an
+                # unprompted voice needs something in front of it. Set false
+                # for a cold open.
+                preannounce: true
+                message: >-
+                  {% set task = repeat.item.summary %}
+                  {{ "Reminder. " ~ task ~ "." }}
+
+  # Snooze from the notification's buttons. Same effect as saying "snooze", but
+  # from the phone, where speaking is often not an option.
+  #
+  # There is deliberately no "Done" button: the dispatcher completes an item
+  # BEFORE announcing it (so a failed announce cannot re-fire forever), so by
+  # the time the notification exists there is nothing left to complete.
+  - id: reminders_notification_action
+    alias: Reminders — snooze from the phone notification
+    description: Handles the Snooze buttons on a reminder notification.
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ (trigger.event.data.action | default('', true)).startswith('REM_SNOOZE_') }}
+    actions:
+      - variables:
+          mins: "{{ trigger.event.data.action.split('_')[-1] | int(10) }}"
+          # Prefer what the notification carried; fall back to the last
+          # announcement when the platform dropped it.
+          from_action: >-
+            {{ trigger.event.data.action_data.task
+               if (trigger.event.data.action_data is defined
+                   and trigger.event.data.action_data.task is defined)
+               else '' }}
+      - variables:
+          task: >-
+            {{ (from_action if from_action else states('input_text.last_reminder'))
+               | default('', true) | trim }}
+
+      - condition: template
+        value_template: "{{ task not in ['', 'unknown', 'unavailable'] }}"
+
+      - variables:
+          due: "{{ (now() + timedelta(minutes=mins | int)).replace(microsecond=0).isoformat() }}"
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task }}"
+          due_datetime: "{{ due }}"
+
+      - action: *notify_target
+        data:
+          title: Snoozed
+          message: >-
+            {%- set d = as_datetime(due) | as_local -%}
+            {%- set h12 = d.hour % 12 -%}
+            {%- set h12 = 12 if h12 == 0 else h12 -%}
+            {{ task }} — again at {{ h12 }}{{ ':%02d' | format(d.minute) }} {{ 'AM' if d.hour < 12 else 'PM' }}
+
+  # Every fired reminder leaves a completed item in the .ics, which nothing
+  # else ever removes. Daily, at an hour when announcing is not a risk.
+  - id: reminders_prune
+    alias: Reminders — prune completed items
+    description: Keeps local_todo's .ics from growing without bound.
+    mode: single
+    triggers:
+      - trigger: time
+        at: "04:00:00"
+    actions:
+      - action: todo.remove_completed_items
+        target:
+          entity_id: *reminder_list
+
+# ---------------------------------------------------------------------------
+# LLM fallback. The grammar above is deliberately narrow, so "remind me tomorrow
+# morning" or "remind me when the game ends" never matches and falls through to
+# the model. This script is what the model gets to call.
+#
+# A script rather than another intent_script, because ScriptTool builds its
+# parameters from `fields` below -- real, described, typed arguments -- whereas
+# an intent_script tool is stuck with the generic name/area/floor schema
+# (findings §14). That is the whole reason phase 3 hid its intents from the LLM.
+#
+# Exposing a script costs nothing in prompt cache: async_get_exposed_entities
+# skips the script and calendar domains outright ("they have their own tools"),
+# so this adds a static tool definition and no churning state line (findings §4).
+#
+# WHY THERE IS NO `when: <ISO datetime>` FIELD, which is the obvious design:
+# asked for one, the model returned "2023-08-12T18:19:00-05:00". The time of day
+# was arithmetically perfect -- 16:19 plus a couple of hours -- and the YEAR was
+# three years wrong, so every reminder failed the in-the-past check. An ISO
+# string hands an 8B model a year, a month and a date to hallucinate when all it
+# is actually good at is small numbers.
+#
+# So it supplies three small integers and this script owns every date decision,
+# which is the same principle as phase 3: no model does the arithmetic.
+# The worst case is now a reminder on the wrong day, never one in 2023.
+script:
+  remind_me:
+    alias: Remind me
+    icon: mdi:bell-ring
+    mode: queued
+    max: 10
+    description: >-
+      Set a reminder to be spoken aloud later. Use this whenever the user asks to
+      be reminded of something, including vague times like "tomorrow morning",
+      "in a couple of hours" or "this evening" -- work out the clock time
+      yourself and pass it here. Always call this rather than replying that you
+      cannot set reminders.
+    fields:
+      what:
+        name: What
+        description: What to remind about, as a short task, without the word "remind".
+        required: true
+        example: "call the bank"
+        selector:
+          text:
+      hour:
+        name: Hour
+        description: Hour to remind, 0-23 on a 24-hour clock. 8am is 8, noon is 12, 8pm is 20.
+        required: true
+        example: 8
+        selector:
+          number:
+            min: 0
+            max: 23
+            mode: box
+      minute:
+        name: Minute
+        description: Minute past the hour, 0-59. Use 0 for a time on the hour.
+        required: false
+        example: 0
+        selector:
+          number:
+            min: 0
+            max: 59
+            mode: box
+      days_from_today:
+        name: Days from today
+        description: 0 for later today, 1 for tomorrow, 2 for the day after, and so on.
+        required: false
+        example: 1
+        selector:
+          number:
+            min: 0
+            max: 365
+            mode: box
+    sequence:
+      - variables:
+          task: "{{ what | default('', true) | trim }}"
+          h: "{{ hour | default(-1, true) | int(-1) }}"
+          mi: "{{ minute | default(0, true) | int(0) }}"
+          off_days: "{{ days_from_today | default(0, true) | int(0) }}"
+
+      - choose:
+          - conditions: "{{ task == '' }}"
+            sequence:
+              - variables:
+                  result:
+                    scheduled: false
+                    speak: "No reminder was set, because no task was given. Say so and ask what the reminder should be about."
+              - stop: "no task"
+                response_variable: result
+
+          - conditions: "{{ h < 0 or h > 23 or mi < 0 or mi > 59 }}"
+            sequence:
+              - variables:
+                  result:
+                    scheduled: false
+                    speak: "No reminder was set: no valid time was given. Say plainly that the reminder was NOT set, and ask what time it should be. Do not claim it was scheduled."
+              - stop: "no valid time"
+                response_variable: result
+
+      - variables:
+          # Every date decision is made here, not by the model. If the requested
+          # clock time has already passed today, it means the next one.
+          resolved: >-
+            {% set t = today_at('%02d:%02d' | format(h, mi)) + timedelta(days=off_days) %}
+            {{ (t + timedelta(days=1) if t <= now() else t).isoformat() }}
+
+      - action: todo.add_item
+        data:
+          entity_id: *reminder_list
+          item: "{{ task }}"
+          due_datetime: "{{ resolved }}"
+
+      # Read back from the list rather than trusting the arguments, so the
+      # confirmation describes a reminder that demonstrably exists (findings §16).
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: needs_action
+        response_variable: check
+
+      - variables:
+          landed: >-
+            {% set ns = namespace(hit=none) %}
+            {% for i in (check.values() | list | first)['items'] %}
+              {% if i.summary == task and i.due is defined
+                    and as_datetime(i.due) == as_datetime(resolved) %}
+                {% set ns.hit = i.due %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.hit if ns.hit is not none else '' }}
+          spoken_time: >-
+            {% set d = as_datetime(resolved) | as_local %}
+            {% set h12 = d.hour % 12 %}
+            {% set h12 = 12 if h12 == 0 else h12 %}
+            {{ h12 }}{{ ':%02d' | format(d.minute) if d.minute else '' }} {{ 'AM' if d.hour < 12 else 'PM' }}{{ '' if d.date() == now().date() else (' tomorrow' if d.date() == (now() + timedelta(days=1)).date() else ' on ' ~ d.strftime('%A')) }}
+
+      - variables:
+          result:
+            scheduled: "{{ landed != '' }}"
+            task: "{{ task }}"
+            time: "{{ spoken_time }}"
+            speak: >-
+              {% if landed != '' %}The reminder is set for {{ spoken_time }}: {{ task }}. Confirm exactly this time back to the user, in your own voice.{% else %}The reminder could NOT be saved. Say plainly that it was not set. Do not claim it was scheduled.{% endif %}
+
+      - stop: "done"
+        response_variable: result

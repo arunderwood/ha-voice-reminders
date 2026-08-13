@@ -1,0 +1,432 @@
+# Reminder grammar. Pairs with packages/reminders.yaml, which holds the
+# intent_script that turns these slots into a todo.reminders item.
+#
+# Deliberately constrained: reminders must not depend on an 8B model doing date
+# arithmetic, so everything here resolves to numbers that a Jinja template can
+# compute exactly. Phrasings this grammar misses fall through to the LLM
+# (PLAN.md phase 5), which is allowed to be approximate.
+#
+# Two intents rather than one, so neither due-time template has to branch on
+# which kind of slot it got.
+#
+# Custom sentences win over built-ins (findings §2), which matters more here
+# than it looks: the built-in HassStartTimer has wildcard sentences of the form
+# "{timer_command} in {timer_hours} hours", so "remind me to do laundry in two
+# hours" matches the TIMER intent with conversation_command="remind me to do
+# laundry". The task-first word orders below exist partly to take that phrasing
+# back. Delete them and that phrasing silently becomes a timer -- which is
+# satellite-bound, has no message, and dies on restart.
+language: en
+
+lists:
+  # 1-23 so both "at 2" and "at 14:30" parse. The template resolves the
+  # meridiem, including the case where none was said.
+  rem_hour:
+    range:
+      from: 1
+      to: 23
+  rem_minute:
+    range:
+      from: 0
+      to: 59
+  # Upper bound is generous on purpose: "in 90 minutes" is a normal thing to
+  # say, and the template converts rather than rejecting.
+  rem_count:
+    range:
+      from: 1
+      to: 600
+
+  # hassil does NOT strip punctuation, so the dotted spellings have to be listed
+  # literally. This matters because the two ways into Assist disagree:
+  # faster-whisper writes "2 PM" at the satellite, while phone dictation writes
+  # "2 p.m." -- the same sentence, and without "a.m."/"p.m." here the phone one
+  # missed the grammar entirely and fell through to the LLM.
+  rem_meridiem:
+    values:
+      - in: "(am|a m|a.m.|in the morning)"
+        out: "am"
+      - in: "(pm|p m|p.m.|in the afternoon|in the evening|tonight)"
+        out: "pm"
+
+  rem_unit:
+    values:
+      - in: "(minute|minutes|min|mins|min.|mins.)"
+        out: "minutes"
+      - in: "(hour|hours|hr|hrs|hr.|hrs.)"
+        out: "hours"
+      - in: "(day|days)"
+        out: "days"
+      - in: "(week|weeks)"
+        out: "weeks"
+
+  # How often a recurring reminder repeats. Monthly is deliberately absent:
+  # month arithmetic in Jinja means clamping 31st-of-the-month to February, and
+  # a wrong date is worse than an unsupported phrase.
+  rem_freq:
+    values:
+      - in: "(day|days)"
+        out: "daily"
+      - in: "(weekday|weekdays|week day|week days)"
+        out: "weekdays"
+
+  # Day-scale units only. The combined "in N <unit> at <time>" shape below is
+  # meaningful for days and weeks and meaningless for minutes and hours, so it
+  # gets its own list rather than reusing rem_unit.
+  rem_dayunit:
+    values:
+      - in: "(day|days)"
+        out: "days"
+      - in: "(week|weeks)"
+        out: "weeks"
+
+  # Monday = 0, matching now().weekday() so the template can subtract directly.
+  rem_weekday:
+    values:
+      - in: "(monday|mondays)"
+        out: "0"
+      - in: "(tuesday|tuesdays)"
+        out: "1"
+      - in: "(wednesday|wednesdays)"
+        out: "2"
+      - in: "(thursday|thursdays)"
+        out: "3"
+      - in: "(friday|fridays)"
+        out: "4"
+      - in: "(saturday|saturdays)"
+        out: "5"
+      - in: "(sunday|sundays)"
+        out: "6"
+      # "the weekend" means Saturday here. Sunday-preferrers can say Sunday.
+      - in: "(weekend|weekends)"
+        out: "5"
+
+  # Fuzzy times, resolved to an hour HERE rather than by the model. Measured
+  # 2026-08-12: asked to schedule "remind me tomorrow morning to call the bank",
+  # the LLM fell back to inventing a confirmation instead of calling the tool in
+  # 2 of 6 attempts. These phrasings are a small closed set, so they belong on
+  # the deterministic path with everything else. `out` IS the 24-hour hour.
+  rem_daypart:
+    values:
+      - in: "morning"
+        out: "8"
+      - in: "afternoon"
+        out: "14"
+      - in: "(evening|night)"
+        out: "19"
+      - in: "noon"
+        out: "12"
+      - in: "midnight"
+        out: "0"
+
+  rem_dayref:
+    values:
+      - in: "(today|this)"
+        out: "0"
+      - in: "tomorrow"
+        out: "1"
+
+  rem_task:
+    wildcard: true
+
+expansion_rules:
+  # The article is OPTIONAL, and that is the entire point of this rule. "Set a
+  # reminder for 9 p.m." worked while "Set reminder for 9 p.m." -- what people
+  # actually type -- missed the grammar and matched a built-in {name} sentence
+  # instead, answering "There is no reminder for 9 p.m. to check." Every verb
+  # here is one people reach for; the cost of a spare alternative is nothing,
+  # the cost of a missing one is a feature that looks broken.
+  rem_verb: >-
+    ((set|create|add|make|schedule|put) [me] [a] [new] reminder|remind me|[a] new reminder)
+  rem_at: "(at|for)"
+  # The word that joins the time to the task. "to" is not the only one people
+  # use -- "remind me at 11 that it's move-in time" is just as natural, and
+  # sometimes there is no connector at all because a comma did the job:
+  # "remind me in 3 days at 11 a.m., time to move in". hassil drops the comma
+  # and leaves the task bare, so after a time the connector must be OPTIONAL.
+  # Before the task (task-first word order) it stays required, since without it
+  # "remind me" would match with the whole rest of the sentence as the task.
+  rem_to: "(to|that)"
+  rem_cancel: "(cancel|delete|remove|forget|drop|scrap|clear)"
+  # Every separator people actually write, and an optional space before the
+  # meridiem. Both halves are load-bearing:
+  #
+  #   [(:|.)]  "10.30" is as common as "10:30" -- and a dot-separated time was
+  #            matching NOTHING at all, so it came back as "You have invented a
+  #            new sentence" rather than as a wrong time.
+  #   [ ]      with a literal space instead, "2:30pm" fails while "2pm" works.
+  #
+  # Covers 2pm, 2 pm, 2 p.m., 2:30pm, 2:30 pm, 2:30 p.m., 2.30, 2.30 p.m.,
+  # 2 30 pm and 14:30 in one rule.
+  rem_time: "{rem_hour:hour}[[(:|.)]{rem_minute:minute}][ ][{rem_meridiem:meridiem}]"
+
+intents:
+  # "remind me at 2 pm to do laundry"
+  SetReminderAbsolute:
+    data:
+      - sentences:
+          - "<rem_verb> <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} <rem_at> <rem_time>"
+
+      # Spoken fractions. `slots` injects the minute directly, and hourshift
+      # handles "quarter to three" meaning 2:45.
+      - sentences:
+          - "<rem_verb> <rem_at> half past {rem_hour:hour} [{rem_meridiem:meridiem}] [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} <rem_at> half past {rem_hour:hour} [{rem_meridiem:meridiem}]"
+        slots:
+          minute: "30"
+
+      - sentences:
+          - "<rem_verb> <rem_at> [a] quarter past {rem_hour:hour} [{rem_meridiem:meridiem}] [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} <rem_at> [a] quarter past {rem_hour:hour} [{rem_meridiem:meridiem}]"
+        slots:
+          minute: "15"
+
+      - sentences:
+          - "<rem_verb> <rem_at> [a] quarter to {rem_hour:hour} [{rem_meridiem:meridiem}] [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} <rem_at> [a] quarter to {rem_hour:hour} [{rem_meridiem:meridiem}]"
+        slots:
+          minute: "45"
+          hourshift: "-1"
+
+  # "remind me in 20 minutes to check the oven"
+  SetReminderRelative:
+    data:
+      - sentences:
+          # Connector REQUIRED here, unlike everywhere else. With it optional,
+          # "remind me in 20 minutes at 10am to break this" parses as a
+          # 20-minute reminder whose task is "at 10am to break this" -- a
+          # silently wrong TIME, which is the worst failure this system has.
+          # Refusing to match sends it to the LLM or to an error instead.
+          - "<rem_verb> in {rem_count:count} {rem_unit:unit} <rem_to> {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in {rem_count:count} {rem_unit:unit}"
+
+      # An article instead of a number. "in an hour" is at least as common as
+      # "in 1 hour", and rem_count is a numeric range, so the count is injected.
+      - sentences:
+          - "<rem_verb> in (a|an) {rem_unit:unit} <rem_to> {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in (a|an) {rem_unit:unit}"
+        slots:
+          count: "1"
+
+      - sentences:
+          - "<rem_verb> in half an hour <rem_to> {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in half an hour"
+        slots:
+          count: "30"
+          unit: "minutes"
+
+      - sentences:
+          - "<rem_verb> in a few {rem_unit:unit} <rem_to> {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in a few {rem_unit:unit}"
+        slots:
+          count: "5"
+
+  # "remind me tomorrow morning to call the bank"
+  SetReminderDaypart:
+    data:
+      - sentences:
+          - "<rem_verb> {rem_dayref:dayref} {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} {rem_dayref:dayref} {rem_daypart:hour}"
+
+      # "tonight" carries both halves in one word.
+      - sentences:
+          - "<rem_verb> tonight [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} tonight"
+        slots:
+          dayref: "0"
+          hour: "19"
+
+      # "in the morning" means the next one, which the roll-forward in the
+      # intent_script already handles from a dayref of 0.
+      - sentences:
+          - "<rem_verb> in the {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in the {rem_daypart:hour}"
+        slots:
+          dayref: "0"
+
+      # "tomorrow at 9" / "today at 6:30 pm"
+      - sentences:
+          - "<rem_verb> {rem_dayref:dayref} <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} {rem_dayref:dayref} <rem_at> <rem_time>"
+
+      # "at noon" / "at midnight" -- the absolute grammar needs a number.
+      - sentences:
+          - "<rem_verb> <rem_at> {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} <rem_at> {rem_daypart:hour}"
+        slots:
+          dayref: "0"
+
+  # "remind me in three days at 10am to check the thing" -- a relative DATE with
+  # an absolute TIME. Neither SetReminderRelative (which keeps the current clock
+  # time) nor SetReminderWeekday (which needs a named day) covers it, so it fell
+  # through to the LLM, which scheduled it correctly and then announced the
+  # wrong time out loud.
+  SetReminderRelativeAt:
+    data:
+      - sentences:
+          - "<rem_verb> in {rem_count:count} {rem_dayunit:unit} <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in {rem_count:count} {rem_dayunit:unit} <rem_at> <rem_time>"
+
+      - sentences:
+          - "<rem_verb> in (a|an) {rem_dayunit:unit} <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in (a|an) {rem_dayunit:unit} <rem_at> <rem_time>"
+        slots:
+          count: "1"
+
+      # "in a week in the morning"
+      - sentences:
+          - "<rem_verb> in (a|an) {rem_dayunit:unit} in the {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in (a|an) {rem_dayunit:unit} in the {rem_daypart:hour}"
+        slots:
+          count: "1"
+
+      # "in three days in the morning"
+      - sentences:
+          - "<rem_verb> in {rem_count:count} {rem_dayunit:unit} in the {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} in {rem_count:count} {rem_dayunit:unit} in the {rem_daypart:hour}"
+
+  # "remind me Friday evening to call mum" / "remind me on Friday at 9 pm to..."
+  #
+  # One intent covers all three shapes because {rem_daypart:hour} and
+  # {rem_hour:hour} fill the SAME slot -- one as "19", one as 19 -- and the
+  # template runs both through `| int`. Only the meridiem and minute slots are
+  # exclusive to the clock-time form.
+  #
+  # "next Friday" is treated as "the next Friday", not the one after. People
+  # disagree about that phrase; this is the reading that cannot schedule
+  # something two weeks out by accident.
+  SetReminderWeekday:
+    data:
+      # Friday evening
+      - sentences:
+          - "<rem_verb> [on] [(the|this|next)] {rem_weekday:weekday} {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} [on] [(the|this|next)] {rem_weekday:weekday} {rem_daypart:hour}"
+
+      # Friday at 9 pm
+      - sentences:
+          - "<rem_verb> [on] [(the|this|next)] {rem_weekday:weekday} <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} [on] [(the|this|next)] {rem_weekday:weekday} <rem_at> <rem_time>"
+
+      # Friday, with no time at all -- the template defaults to 9 AM.
+      - sentences:
+          - "<rem_verb> [on] [(the|this|next)] {rem_weekday:weekday} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} [on] [(the|this|next)] {rem_weekday:weekday}"
+
+  # "remind me every day at 10:30 to take the medicine"
+  #
+  # Recurrence is stored in the to-do item's own description as
+  # "repeat:daily" / "repeat:weekdays" / "repeat:weekly:<0-6>", because
+  # local_todo has no recurrence field and todo.add_item has no rrule. The
+  # dispatcher reads it back when the item fires and schedules the next one,
+  # so the series lives entirely inside the list -- no extra helper, and
+  # cancelling the pending item cancels the series.
+  SetReminderRecurring:
+    data:
+      # "every day at 10:30" / "every weekday at 8 am"
+      - sentences:
+          - "<rem_verb> every {rem_freq:freq} <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} every {rem_freq:freq} <rem_at> <rem_time>"
+
+      # "every morning" / "every evening"
+      - sentences:
+          - "<rem_verb> every {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} every {rem_daypart:hour}"
+        slots:
+          freq: "daily"
+
+      # "every weekday morning"
+      - sentences:
+          - "<rem_verb> every {rem_freq:freq} {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} every {rem_freq:freq} {rem_daypart:hour}"
+
+      # "every Tuesday at 9" / "every Tuesday morning" / "every Tuesday"
+      - sentences:
+          - "<rem_verb> every {rem_weekday:weekday} <rem_at> <rem_time> [<rem_to>] {rem_task:task}"
+          - "<rem_verb> every {rem_weekday:weekday} {rem_daypart:hour} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> every {rem_weekday:weekday} [<rem_to>] {rem_task:task}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} every {rem_weekday:weekday} <rem_at> <rem_time>"
+          - "<rem_verb> [<rem_to>] {rem_task:task} every {rem_weekday:weekday} {rem_daypart:hour}"
+          - "<rem_verb> [<rem_to>] {rem_task:task} every {rem_weekday:weekday}"
+        slots:
+          freq: "weekly"
+
+  # "snooze", "snooze for 10 minutes", "remind me again in 5 minutes"
+  #
+  # No task slot: snoozing means "that one, the one you just said", so the
+  # dispatch automation records what it last announced in
+  # input_text.last_reminder and this reads it back. Anything else would need
+  # the user to repeat the task they were just reminded of.
+  SnoozeReminder:
+    data:
+      - sentences:
+          - "snooze [that] [for] {rem_count:count} {rem_unit:unit}"
+          - "remind me again in {rem_count:count} {rem_unit:unit}"
+
+      - sentences:
+          - "remind me in {rem_count:count} {rem_unit:unit} again"
+          - "give me {rem_count:count} more {rem_unit:unit}"
+
+      - sentences:
+          - "snooze [that|it]"
+          - "remind me again [later]"
+          - "postpone [that|it]"
+        slots:
+          count: "10"
+          unit: "minutes"
+
+  # --- Reading and cancelling -------------------------------------------
+  #
+  # The built-in HassListRemoveItem / HassListCompleteItem cannot do this job:
+  # they find the list through a {name} slot, which needs todo.reminders exposed
+  # to conversation, and exposing it is precisely what findings §4 forbids. So
+  # the list is named here instead, in sentences that never mention it.
+  #
+  # No collision with the timer intents -- every built-in cancel sentence
+  # carries the noun "timer".
+  ListReminders:
+    data:
+      - sentences:
+          - "(what|which) [are] [my|the] [upcoming|pending|next] reminders"
+          - "(what|which) reminders do i have [left|pending|coming up]"
+          - "(list|read) [me] [my|the] [upcoming|pending] reminders"
+          - "tell me [my|the] reminders"
+          - "tell me about [my|the] reminders"
+          - "what about [my|the] reminders"
+          - "do i have any [upcoming|pending] reminders"
+          - "what am i being reminded (of|about)"
+          - "what is on my reminder list"
+          - "what's on my reminder list"
+          - "show [me] [my|the] [upcoming|pending] reminders"
+          - "read out [my|the] reminders"
+          - "[are there] any [upcoming|pending] reminders"
+
+  # "open my reminders" -- puts the list on the PHONE, since the satellite has
+  # no screen. Deliberately "open"/"pull up" only: ListReminders already owns
+  # "show me my reminders", and speaking them aloud is the better default.
+  #
+  # "to-do" is spelled out with and without the hyphen because hassil does not
+  # strip punctuation (findings §21).
+  OpenReminderList:
+    data:
+      - sentences:
+          - "(open|pull up) [my|the] (reminders|reminder list|to do list|to-do list|todo list)"
+          - "(show|open|pull up) [me] [my|the] (reminders|reminder list|to do list|to-do list|todo list) on [my] phone"
+
+  # "cancel the reminder to do laundry"
+  CancelReminder:
+    data:
+      - sentences:
+          - "<rem_cancel> [the|my] reminder (to|about|for) {rem_task:task}"
+          - "<rem_cancel> [the|my] {rem_task:task} reminder"
+
+  CancelNextReminder:
+    data:
+      - sentences:
+          - "<rem_cancel> [the|my] (next|upcoming|soonest) reminder"
+
+  CancelAllReminders:
+    data:
+      - sentences:
+          - "<rem_cancel> [all] [of] [my|the] reminders"
+          - "<rem_cancel> (every|all) reminder[s]"
+          - "clear [all] [of] [my|the] reminders"

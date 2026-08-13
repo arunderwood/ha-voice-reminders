@@ -1,0 +1,7 @@
+# The offline suites need only these; they do not need a running Home Assistant.
+#   python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
+hassil>=2.0
+home-assistant-intents>=2024.1
+PyYAML>=6.0
+# The end-to-end suites additionally talk to a live Home Assistant.
+aiohttp>=3.9
