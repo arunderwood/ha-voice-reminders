@@ -29,25 +29,6 @@
 # (findings §1) needs response.matched_states to be non-empty
 # (pipeline.py:_get_all_targets_in_satellite_area returns False on an empty
 # list), and an intent_script that targets no name/area/floor never sets any.
-# Holds the summary of the most recently announced reminder, so "snooze" knows
-# what "that" refers to. Not exposed to conversation: it changes on every
-# reminder and would churn the LLM prompt cache (findings §4).
-input_text:
-  last_reminder:
-    name: Last reminder announced
-    icon: mdi:bell-sleep
-    max: 255
-
-# ...and when it was announced. Without this the summary above never expires,
-# so "snooze" at 3pm cheerfully resurrects something that fired at 9am -- or,
-# as actually happened, a test reminder from twenty minutes earlier.
-input_datetime:
-  last_reminder_at:
-    name: Last reminder announced at
-    icon: mdi:bell-sleep
-    has_date: true
-    has_time: true
-
 intent_script:
   # "remind me at 2 pm to do laundry"
   SetReminderAbsolute:
@@ -358,19 +339,40 @@ intent_script:
 
   # "snooze" / "snooze for 20 minutes" / "remind me again in 5 minutes"
   #
-  # Reads the task from input_text.last_reminder, which the dispatch automation
-  # writes every time it announces something. Without that there is no way to
-  # know which reminder "that one" means.
+  # "that one" is the reminder most recently announced, which is the newest
+  # COMPLETED item on the list -- the dispatcher completes an item before
+  # announcing it. Reading it back from the list means there is no helper entity
+  # to keep in step, and no second copy of the state to go stale.
   SnoozeReminder:
     platforms: [conversation]
     action:
+      # The newest COMPLETED item is, by construction, the last thing the
+      # dispatcher announced -- it completes an item before announcing it. Its
+      # `completed` timestamp gives the staleness bound for nothing, so no
+      # helper entity is needed, and there is no separate copy of this state to
+      # drift out of step with the list. (It did drift: a helper once held a
+      # stale test reminder for hours.)
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: completed
+        response_variable: recent
+
       - variables:
-          last: "{{ states('input_text.last_reminder') | default('', true) | trim }}"
-          # Seconds since the last announcement. The input_datetime carries a
-          # `timestamp` attribute, so no parsing and no timezone trap.
-          age: >-
-            {% set ts = state_attr('input_datetime.last_reminder_at', 'timestamp') %}
-            {{ ((as_timestamp(now()) - ts) | round(0) | int) if ts is not none else 999999 }}
+          newest: >-
+            {% set ns = namespace(ts=0, summary='') %}
+            {% for i in (recent.values() | list | first)['items'] %}
+              {% if i.completed is defined %}
+                {% set t = as_timestamp(as_datetime(i.completed)) %}
+                {% if t > ns.ts %}{% set ns.ts = t %}{% set ns.summary = i.summary %}{% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ {'summary': ns.summary,
+                'age': ((as_timestamp(now()) - ns.ts) | round(0) | int) if ns.ts else 999999} }}
+      - variables:
+          last: "{{ newest.summary }}"
+          age: "{{ newest.age }}"
 
       - choose:
           - conditions: "{{ last in ['', 'unknown', 'unavailable'] }}"
@@ -808,20 +810,6 @@ automation:
                     due_datetime: "{{ next_due }}"
                     description: "{{ repeat.item.description }}"
 
-            # Recorded before anything can fail, so "snooze" still works even
-            # if the announce or the push does not.
-            - action: input_text.set_value
-              target:
-                entity_id: input_text.last_reminder
-              data:
-                value: "{{ repeat.item.summary[:255] }}"
-
-            - action: input_datetime.set_datetime
-              target:
-                entity_id: input_datetime.last_reminder_at
-              data:
-                datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
-
             # Before the announce, so a silent satellite still reaches the phone.
             - action: *notify_target
               data:
@@ -833,8 +821,8 @@ automation:
                   tag: "reminder_{{ repeat.item.uid }}"
                   actions:
                     # action_data is documented as returned on iOS; Android may
-                    # drop it, so the handler falls back to
-                    # input_text.last_reminder and works either way.
+                    # drop it, so the handler falls back to the newest completed
+                    # item and works either way.
                     - action: REM_SNOOZE_10
                       title: Snooze 10 min
                       action_data:
@@ -879,17 +867,33 @@ automation:
     actions:
       - variables:
           mins: "{{ trigger.event.data.action.split('_')[-1] | int(10) }}"
-          # Prefer what the notification carried; fall back to the last
-          # announcement when the platform dropped it.
+          # Prefer what the notification carried; fall back to the newest
+          # completed item when the platform dropped it (Android does).
           from_action: >-
             {{ trigger.event.data.action_data.task
                if (trigger.event.data.action_data is defined
                    and trigger.event.data.action_data.task is defined)
                else '' }}
+
+      - action: todo.get_items
+        target:
+          entity_id: *reminder_list
+        data:
+          status: completed
+        response_variable: recent
+
       - variables:
           task: >-
-            {{ (from_action if from_action else states('input_text.last_reminder'))
-               | default('', true) | trim }}
+            {% if from_action %}{{ from_action | trim }}{% else %}
+              {% set ns = namespace(ts=0, summary='') %}
+              {% for i in (recent.values() | list | first)['items'] %}
+                {% if i.completed is defined %}
+                  {% set t = as_timestamp(as_datetime(i.completed)) %}
+                  {% if t > ns.ts %}{% set ns.ts = t %}{% set ns.summary = i.summary %}{% endif %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.summary }}
+            {% endif %}
 
       - condition: template
         value_template: "{{ task not in ['', 'unknown', 'unavailable'] }}"

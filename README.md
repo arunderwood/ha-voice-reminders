@@ -148,6 +148,12 @@ instead of `to`.
 **Responses are plain by default.** `examples/personality.md` shows how to give
 them a character, with the mechanism the author uses.
 
+**Snooze has no state of its own.** "That one" is the reminder most recently
+announced, which is the newest *completed* item on the list — the dispatcher
+completes an item before it announces it. So there is no helper entity to keep
+in step, and a snooze older than an hour is refused using the item's own
+completion timestamp.
+
 **Recurrence is stored in the to-do item's own description** (`repeat:weekly:3`),
 because `local_todo` has no recurrence field and `todo.add_item` has no `rrule`.
 The dispatcher reads it back when an item fires and schedules the next
